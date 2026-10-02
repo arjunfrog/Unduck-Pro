@@ -441,7 +441,7 @@ struct ContentView: View {
         .padding(.horizontal, 16).padding(.top, 15).padding(.bottom, 13)
     }
 
-    // Settings body — Launch at login, Updates, Report a problem, Reset.
+    // Settings body — Launch at login, Calls only, Updates, Report a problem, Reset.
     private var settingsContent: some View {
         VStack(spacing: 10) {
             // Launch at login
@@ -452,6 +452,17 @@ struct ContentView: View {
                 ToggleSwitch(isOn: Binding(
                     get: { manager.launchAtLogin },
                     set: { manager.setLaunchAtLogin($0) }
+                ))
+            }
+
+            // Calls only — no taps (and no purple recording dot) between calls
+            settingsCard {
+                settingsIcon("phone")
+                settingsText("Only run during calls", "Hides the purple recording dot between calls. App volumes apply on calls.")
+                Spacer(minLength: 8)
+                ToggleSwitch(isOn: Binding(
+                    get: { manager.callsOnly },
+                    set: { manager.setCallsOnly($0) }
                 ))
             }
 
@@ -541,7 +552,9 @@ struct ContentView: View {
 
     // Status banner
     @ViewBuilder private var statusBanner: some View {
-        if let error = manager.error {
+        if manager.isStandby, manager.error == nil {
+            standbyBanner
+        } else if let error = manager.error {
             HStack(spacing: 11) {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
                 Text(error.localizedDescription).font(.system(size: 12, weight: .medium))
@@ -575,6 +588,21 @@ struct ContentView: View {
             .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(Theme.green.opacity(0.3)))
             .opacity(manager.isRunning ? 1 : 0.55)
         }
+    }
+
+    /// Calls-only mode between calls: no taps are running.
+    private var standbyBanner: some View {
+        HStack(spacing: 11) {
+            EQBars(active: false, color: Theme.ink3, bases: [7, 14, 9, 12], barWidth: 3)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Standby").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.ink)
+                Text("Wakes up when a call starts").font(.system(size: 11)).foregroundStyle(Theme.ink2)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 13).padding(.vertical, 11)
+        .background(RoundedRectangle(cornerRadius: 13).fill(Color.white.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(Color.white.opacity(0.10)))
     }
 
     // Section label

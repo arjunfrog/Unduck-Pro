@@ -15,12 +15,12 @@ final class DuckAudioAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusBarController = StatusBarController(manager: manager)
-        manager.startEngine()
+        manager.launch()
         manager.checkForUpdates()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        manager.stopEngine()
+        manager.shutdown()
     }
 }
 

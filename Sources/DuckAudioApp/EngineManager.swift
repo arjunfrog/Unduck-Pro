@@ -41,6 +41,17 @@ final class EngineManager: ObservableObject, CallWatcherDelegate {
     /// Whether the app is registered to launch at login (Settings toggle).
     @Published var launchAtLogin: Bool = false
 
+    /// Only run the audio taps while a call is live (Settings toggle, off by
+    /// default). The taps are what light macOS's purple "System Audio
+    /// Recording" dot; the call watcher only reads the process list, so between
+    /// calls nothing shows.
+    @Published private(set) var callsOnly: Bool = false
+    private let callsOnlyKey = "UnduckProCallsOnly"
+
+    /// Calls-only mode with no call: the taps are off and the watcher is
+    /// waiting to wake them.
+    var isStandby: Bool { callsOnly && !isRunning && !isInCall }
+
     /// Update state (auto-checked against GitHub Releases).
     @Published var updateAvailable = false
     @Published var latestVersion: String?
@@ -75,11 +86,50 @@ final class EngineManager: ObservableObject, CallWatcherDelegate {
     private var menuVisible = false
     private var runningAppsTickCounter = 0
     private var rebuildRetryTask: Task<Void, Never>?
+    private var callEndStopTask: Task<Void, Never>?
+    private var isWatching = false
+
+    /// How long the taps stay up after a call ends, so a brief mic dropout
+    /// (route change, hold) doesn't tear down and rebuild every pipeline.
+    private let callEndGrace: Duration = .seconds(5)
 
     init() {
         favorites = Set(UserDefaults.standard.stringArray(forKey: favKey) ?? [])
         if let saved = UserDefaults.standard.dictionary(forKey: volKey) as? [String: Double] {
             volumes = saved
+        }
+        callsOnly = UserDefaults.standard.bool(forKey: callsOnlyKey)
+    }
+
+    // MARK: - App lifecycle
+
+    /// App launch: always watch for calls; start the taps now only when the
+    /// mixer should run all the time.
+    func launch() {
+        startWatching()
+        if callsOnly {
+            // Ask for mic access now rather than in the middle of the first call.
+            AVAudioApplication.requestRecordPermission { _ in }
+        } else {
+            startEngine()
+        }
+    }
+
+    func shutdown() {
+        callEndStopTask?.cancel(); callEndStopTask = nil
+        stopEngine()
+        callWatcher.stop()
+        isWatching = false
+    }
+
+    /// The watcher runs for the app's whole life, independent of the taps —
+    /// it's what wakes them when a call starts.
+    private func startWatching() {
+        guard !isWatching else { return }
+        isWatching = true
+        callWatcher.delegate = self
+        DispatchQueue.global(qos: .utility).async {
+            self.callWatcher.start()
         }
     }
 
@@ -102,8 +152,7 @@ final class EngineManager: ObservableObject, CallWatcherDelegate {
             // the IO proc) runs OFF the main thread — doing it on main blocked
             // the menu from rendering, so the first open hung for seconds.
             DispatchQueue.global(qos: .userInitiated).async {
-                self.callWatcher.delegate = self
-                self.callWatcher.start()
+                self.callWatcher.pollNow()   // fresh call state before the first taps
                 self.engine.excludedCallIDs = self.callWatcher.currentState.excludedObjectIDs
                 self.engine.activeCallFamilies = self.callWatcher.currentState.activeFamilies
                 do {
@@ -112,7 +161,6 @@ final class EngineManager: ObservableObject, CallWatcherDelegate {
                     Task { @MainActor in
                         self.isStarting = false
                         self.error = error
-                        self.callWatcher.stop()
                     }
                     return
                 }
@@ -135,31 +183,61 @@ final class EngineManager: ObservableObject, CallWatcherDelegate {
                     // Only spin up the polling timer + first refresh if the panel
                     // is actually open; otherwise the engine just runs quietly.
                     if self.menuVisible { self.tick(); self.startUITimer() }
+                    // The call may have ended while the taps were starting.
+                    self.updateCallsOnlyEngine(inCall: self.callWatcher.currentState.isInCall)
                 }
             }
         }
     }
 
+    /// Tear down the taps. The call watcher keeps running.
     func stopEngine() {
         guard isRunning else { return }
-        stopUITimer()
         rebuildRetryTask?.cancel(); rebuildRetryTask = nil
-        callWatcher.stop()
         try? engine.stop()
         isRunning = false
-        apps = []
+        if menuVisible { rebuildAppList() } else { apps = [] }
+    }
+
+    /// In calls-only mode, bring the taps up as soon as a call starts and take
+    /// them down a few seconds after it ends.
+    private func updateCallsOnlyEngine(inCall: Bool) {
+        guard callsOnly else { return }
+        if inCall {
+            callEndStopTask?.cancel(); callEndStopTask = nil
+            startEngine()
+        } else if (isRunning || isStarting), callEndStopTask == nil {
+            callEndStopTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                try? await Task.sleep(for: self.callEndGrace)
+                guard !Task.isCancelled else { return }
+                self.callEndStopTask = nil
+                if self.callsOnly, !self.callWatcher.currentState.isInCall { self.stopEngine() }
+            }
+        }
+    }
+
+    func setCallsOnly(_ on: Bool) {
+        callsOnly = on
+        UserDefaults.standard.set(on, forKey: callsOnlyKey)
+        if !on {
+            callEndStopTask?.cancel(); callEndStopTask = nil
+            startEngine()
+        } else if !callWatcher.currentState.isInCall {
+            stopEngine()   // no call right now — the dot goes away immediately
+        }
     }
 
     // MARK: - Panel visibility
 
-    /// Called when the menu panel opens. Starts the engine (idempotent) and
-    /// resumes live UI polling.
+    /// Called when the menu panel opens. Starts the engine (idempotent) unless
+    /// it's waiting for a call, and resumes live UI polling.
     func menuDidOpen() {
         menuVisible = true
         runningAppsTickCounter = 0   // refresh the Add-Favorite list right away
         refreshLaunchAtLogin()       // keep the Settings toggle in sync
-        startEngine()                // the engine runs whenever the app is open
-        if isRunning { tick(); startUITimer() }
+        if !callsOnly { startEngine() }
+        tick(); startUITimer()
     }
 
     /// Called when the panel closes. The engine, un-duck loop and call watcher
@@ -171,7 +249,7 @@ final class EngineManager: ObservableObject, CallWatcherDelegate {
     }
 
     private func startUITimer() {
-        guard timer == nil, isRunning, menuVisible else { return }
+        guard timer == nil, menuVisible else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }   // fires on the main run loop
         }
@@ -191,6 +269,8 @@ final class EngineManager: ObservableObject, CallWatcherDelegate {
         let outputIDs = watcher.currentOutputObjectIDs
         let outputDeviceID = watcher.currentOutputDeviceID
         Task { @MainActor in
+            self.isInCall = newState.isInCall
+            self.updateCallsOnlyEngine(inCall: newState.isInCall)
             self.reconcileAudioState(
                 newState,
                 outputIDs: outputIDs,
@@ -398,6 +478,7 @@ final class EngineManager: ObservableObject, CallWatcherDelegate {
     }
 
     private func reapplyGains() {
+        guard isRunning else { return }
         for (key, info) in groupActiveApps() {
             let v = volumes[key] ?? 1.0
             let m = mutes[key] ?? false
@@ -459,11 +540,33 @@ final class EngineManager: ObservableObject, CallWatcherDelegate {
 
     private struct GroupInfo { var name: String; var icon: NSImage?; var processIDs: [AudioObjectID] }
 
+    private struct PlayingProcess {
+        let processObjectID: AudioObjectID
+        let pid: pid_t
+        let bundleID: String?
+        let isCall: Bool
+    }
+
+    /// Processes currently producing audio: the live taps, or in standby a plain
+    /// Core Audio scan (no taps, so no recording dot). Sliders moved in standby
+    /// are saved and applied once a call wakes the taps.
+    private func playingProcesses() -> [PlayingProcess] {
+        if isRunning {
+            return engine.tappedApps.map {
+                PlayingProcess(processObjectID: $0.processObjectID, pid: $0.pid, bundleID: $0.bundleID, isCall: $0.isCall)
+            }
+        }
+        let me = (try? AudioProcessProbe.currentProcessObjectID()) ?? kAudioObjectUnknown
+        return ((try? AudioProcessProbe.allProcesses()) ?? [])
+            .filter { $0.isRunningOutput && $0.objectID != me && ($0.processName != nil || $0.bundleID != nil) }
+            .map { PlayingProcess(processObjectID: $0.objectID, pid: $0.pid ?? -1, bundleID: $0.bundleID, isCall: false) }
+    }
+
     /// Currently-playing apps grouped by their parent GUI app. Call apps are
     /// included so the call itself (FaceTime / Zoom…) gets a working slider.
     private func groupActiveApps() -> [String: GroupInfo] {
         var groups: [String: GroupInfo] = [:]
-        for tapped in engine.tappedApps {
+        for tapped in playingProcesses() {
             let respPID = AudioAppMonitor.responsiblePID(for: tapped.pid)
             let app = NSRunningApplication(processIdentifier: respPID)
                 ?? NSRunningApplication(processIdentifier: tapped.pid)

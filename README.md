@@ -114,6 +114,10 @@ Unduck Pro is built entirely on Apple's **public Core Audio process-tap** API
 - **Per-app mixer:** every playing app and call is routed through its own independent
   audio pipeline, scaled by your chosen volume, and passed through a hard limiter so
   nothing can ever blast your speakers.
+- **Only run during calls (optional):** macOS shows a purple *System Audio Recording*
+  dot whenever those pipelines are running. Turn this on in Settings and Unduck Pro
+  keeps them off between calls — no dot — and wakes up on its own when a call starts.
+  Per-app volumes then apply during calls only.
 
 ---
 
